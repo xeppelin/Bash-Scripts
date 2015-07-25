@@ -1,0 +1,208 @@
+#!/bin/bash
+_BTRFSROOTDIR="/mnt/btrfs";
+_SYSROOT="$_BTRFSROOTDIR/active";
+_SNAPROOT="$_BTRFSROOTDIR/snapshots";
+_BACKUPVOL="rootvol";
+_BACKUPVOLFULLPATH="$_SYSROOT/$_BACKUPVOL";
+_MODE="snapshot";
+_RESTORE="false";
+_ARCHIVEDIR="/mnt/backup/SOL";
+_TYPE="manual";
+_TIMESTAMP=$(date +%m_%d_%Y-%H_%M);
+_SNAPSHOTNAME="$_TYPE-$_BACKUPVOL-$_TIMESTAMP";
+_OUTPUT="/var/log/snapman.log";
+
+if [ "$EUID" -ne 0 ]
+        then echo "Script must be run as root!";
+        exit 1;
+fi
+
+clean_system () {
+	echo "Cleaning unnecessary files from system." >> "$_OUTPUT";
+	/sbin/btrfs scrub start -B -d / >> "$_OUTPUT";
+	apt-get autoremove -y -q >> "$_OUTPUT";
+	apt-get clean -q >> "$_OUTPUT";
+}
+
+create_snapshot () {
+	echo "Creating BTRFS snapshot $_SNAPSHOTNAME" >> "$_OUTPUT";
+	/sbin/btrfs subvolume snapshot "$_BACKUPVOLFULLPATH" "$_SNAPROOT/$_SNAPSHOTNAME" >> "$_OUTPUT";
+}
+
+create_archive () {
+	echo "Creating read-only BTRFS snapshot to use as archive source." >> "$_OUTPUT";
+	/sbin/btrfs subvolume snapshot -r "$_BACKUPVOLFULLPATH" "$_SNAPROOT/$_SNAPSHOTNAME" >> "$_OUTPUT";
+	_TAREXCLUDES="--exclude='dev/*' --exclude='proc/*' --exclude='sys/*' --exclude='tmp/*' --exclude='run/*' --exclude='media/*'";
+	while read _LINE <&3; do
+		_TAREXCLUDES="$_TAREXCLUDES --exclude='/mnt/$_LINE/*'";
+	done 3<<< "$(/usr/bin/find /mnt -maxdepth 1 -printf "%f\n")";
+	if [ "$_OUTPUT" == "/dev/stdout" ]; then
+		/bin/tar -czvf "$_ARCHIVEDIR/$_SNAPSHOTNAME.tar.gz" "$_TAREXCLUDES" -C "$_SNAPROOT/$_SNAPSHOTNAME" . >> "$_OUTPUT";
+	else
+		/bin/tar -czf "$_ARCHIVEDIR/$_SNAPSHOTNAME.tar.gz" "$_TAREXCLUDES" -C "$_SNAPROOT/$_SNAPSHOTNAME" . >> "$_OUTPUT";
+	fi
+	/sbin/btrfs subvolume delete "$_SNAPROOT/$_SNAPSHOTNAME" >> "$_OUTPUT";
+	echo "Archive of $_BACKUPVOL saved to $_ARCHIVEDIR/$_SNAPSHOTNAME.tar.gz" >> "$_OUTPUT"; 
+}
+
+remove_old_snapshots () {
+	_I=0;
+	while read _LINE <&3; do
+		if [ "$_I" -ge "$_NUM_TO_KEEP" ]; then
+                /sbin/btrfs subvolume delete "$_LINE" >> "$$_OUTPUT";
+                echo "Removed BTRFS snapshot $_LINE" >> "$_OUTPUT";
+        fi
+        _I=$((_I+1))
+	done 3<<< "$(/usr/bin/find "$_SNAPROOT" -maxdepth 1 -type d -name "$_TYPE-$_BACKUPVOL"* | /usr/bin/sort -r)";
+}
+
+remove_old_archives () {
+	_I=0;
+	while read _LINE <&3; do
+		if [ "$_I" -ge "$_NUM_TO_KEEP" ]; then
+                rm $_LINE >> "$_OUTPUT";
+                echo "Removed archive $_LINE" >> "$_OUTPUT";
+        fi
+        _I=$((_I+1))
+	done 3<<< "$(/usr/bin/find "$_ARCHIVEDIR" -type f -name "$_TYPE-$_BACKUPVOL"*".tar.gz" | /usr/bin/sort -r)";
+}
+
+restore_snapshot () {
+	if [[ ! "$_RESTORE" == *"/"* ]]; then
+		_RESTORE="$_SNAPROOT/$_RESTORE";
+	fi
+	if [ ! -d $_RESTORE ];  then
+		echo "Unable to find snapshot $_RESTORE to restore!" >> "$_OUTPUT";
+		exit 1;
+	fi
+	
+	echo "Restoring snapshot $_RESTORE" >> "$_OUTPUT";
+	/bin/mv "$_BACKUPVOLFULLPATH" "$_SNAPROOT/$_SNAPSHOTNAME";
+	/bin/mv "$_RESTORE" "$_BACKUPVOLFULLPATH";
+	echo "Snapshot restoration complete! A reboot is required to finish." >> "$_OUTPUT";
+}
+
+restore_archive () {
+	if [[ ! "$_RESTORE" == *"/"* ]]; then
+		_RESTORE="$_ARCHIVEDIR/$_RESTORE";
+	fi
+	if [ ! -f $_RESTORE ];  then
+		echo "Unable to find archive $_RESTORE to restore!" >> "$_OUTPUT";
+		exit 1;
+	fi
+	echo "Restoring archive $_RESTORE" >> "$_OUTPUT";
+	/sbin/btrfs subvolume create "$_SYSROOT/restoretmp" >> "$_OUTPUT";
+	if [ "$_OUTPUT" == "/dev/stdout" ]; then
+		/bin/tar -xvhzf "$_RESTORE" -C "$_SYSROOT/restoretmp" >> "$_OUTPUT";
+	else
+		/bin/tar -xhzf "$_RESTORE" -C "$_SYSROOT/restoretmp" >> "$_OUTPUT";
+	fi
+	/bin/mv "$_BACKUPVOLFULLPATH" "$_SNAPROOT/$_SNAPSHOTNAME";
+	/bin/mv "$_SYSROOT/restoretmp" "$_BACKUPVOLFULLPATH";
+	echo "Archive restoration complete! A reboot is required to finish." >> "$_OUTPUT";
+}
+
+for var in "$@"; do
+	_VARSIZE=${#var};
+	case "$var" in
+		"-type="*)
+			_TYPE=${var:6:$_VARSIZE};
+			_SNAPSHOTNAME="$_TYPE-$_BACKUPVOL-$_TIMESTAMP";
+		;;
+		"-subvol="*)
+			_BACKUPVOL=${var:8:$_VARSIZE};
+			_BACKUPVOLFULLPATH="$SYSROOT/$_BACKUPVOL";
+			_SNAPSHOTNAME="$_TYPE-$_BACKUPVOL-$_TIMESTAMP";
+			if [ ! -e "$_BACKUPVOLFULLPATH" ]; then
+				echo "Subvolume doesn't exist!";
+				exit 1;
+			fi
+		;;
+		"-archive")
+			_MODE="archive";
+		;;
+		"-snapshot")
+			_MODE="snapshot";
+		;;
+		"-restore="*)
+			_RESTORE=${var:9:$_VARSIZE};
+			_TYPE="restore";
+			_BACKUPVOL="$(echo "$_RESTORE" | /usr/bin/rev | /usr/bin/cut -d'-' -f 3 | /usr/bin/rev)";
+			_BACKUPVOLFULLPATH="$_SYSROOT/$_BACKUPVOL";
+			if [ ! -d "$_BACKUPVOLFULLPATH" ]; then
+				echo "Can't find volume \"$_BACKUPVOL\" to restore to!";
+				exit 1;
+			fi
+			_SNAPSHOTNAME="$_TYPE-$_BACKUPVOL-$_TIMESTAMP";
+		;;
+		"-v")
+			_OUTPUT="/dev/stdout";
+		;;
+		"--help")
+			echo "";
+			echo "  snapman [-v] [-type={boot|daily|weekly|monthly|manual}] [-archive|-snapshot] [-restore=(InputName)]";
+			echo "";
+			echo "  --help : Display this help message.";
+			echo "  -type= : Set snapshot or archive type.";
+			echo "    Possible types are: boot, daily, weekly, monthly, and manual.";
+			echo "  -archive : Create tar.gz archive from snapshot.";
+			echo "  -snapshot : Just create a snapshot. (default)";
+			echo "  -resotore= : Name of tar.gz archive or snapshot to restore.";
+			echo "  -v : Output to stdout instead of logfile.";
+			echo "";
+			exit 0;
+		;;
+		*)
+			echo "Wrong usage!";
+			exit 1;
+	esac
+done
+
+case "$_TYPE" in
+	"boot")
+		_NUM_TO_KEEP=3;
+	;;
+	"daily")
+		_NUM_TO_KEEP=7;
+	;;
+	"weekly")
+		_NUM_TO_KEEP=4;
+	;;
+	"monthly")
+		_NUM_TO_KEEP=3;
+	;;
+	"manual")
+		_NUM_TO_KEEP=3;
+	;;
+	#Restore is here purely for the automatic snapshot creation during restores
+	"restore")
+		_NUM_TO_KEEP=3;
+	;;
+	*)
+		echo "Unrecognised type. Choices are boot, daily, weekly, monthly, and manual.";
+		exit 1;
+esac
+
+case "$_MODE" in
+	"archive")
+		if [ "$_RESTORE" == "false" ]; then
+			clean_system;
+			create_archive;
+			remove_old_archives;
+		else
+			restore_archive;
+		fi
+	;;
+	"snapshot")
+		if [ "$_RESTORE" == "false" ]; then
+			clean_system;
+			create_snapshot;
+			remove_old_snapshots;
+		else
+			restore_snapshot;
+		fi
+	;;
+	*)
+		echo "Unknown mode!";
+		exit 1;
+esac
